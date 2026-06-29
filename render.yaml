@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: waziride
+    runtime: python
+    pythonVersion: "3.12"
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 4
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: TZ
+        value: Africa/Nairobi
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_FROM
+        value: "whatsapp:+14155238886"
+      - key: AT_USERNAME
+        sync: false
+      - key: AT_API_KEY
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
