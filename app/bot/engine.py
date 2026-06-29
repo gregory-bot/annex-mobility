@@ -156,14 +156,25 @@ def _quotes_from_data(data: dict) -> list[dict]:
 
 
 def _platform_from_choice(quotes: list[dict], choice: str) -> Optional[dict]:
+    """Map user reply to a platform quote. Numbers match display order: cars first, then bikes."""
     choice = choice.strip()
+
+    # Build ordered list matching display: cars first, then bikes
+    cars = [q for q in quotes if q["type"] == "car"]
+    bikes = [q for q in quotes if q["type"] == "motorbike"]
+    ordered = cars + bikes
+
+    # Numeric choice
     if choice.isdigit():
         idx = int(choice) - 1
-        if 0 <= idx < len(quotes):
-            return quotes[idx]
+        if 0 <= idx < len(ordered):
+            return ordered[idx]
+
+    # Name match (uber, bolt, little, faras, yego, bolt_bike)
     for q in quotes:
         if q["platform"].lower() == choice.lower() or q["name"].lower() == choice.lower():
             return q
+
     return None
 
 
@@ -336,7 +347,7 @@ def _format_sos(trip: Trip, driver: Optional[Driver], user_phone: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# NLU fast path - skip step-by-step if intent is clear
+# NLU fast path
 # ---------------------------------------------------------------------------
 
 async def _try_nlu_fast_path(
@@ -358,7 +369,6 @@ async def _try_nlu_fast_path(
     if not extracted:
         return None
 
-    # Case 1: Both pickup AND dropoff in one message
     if extracted.pickup and extracted.dropoff:
         loc_pickup = await _resolve_location(extracted.pickup)
         loc_dropoff = await _resolve_location(extracted.dropoff)
@@ -397,7 +407,6 @@ async def _try_nlu_fast_path(
         if not quotes:
             return Reply("Could not fetch prices right now. Please try again. Send HI to restart.")
 
-        # Apply preference filter
         if extracted.platform_preference and extracted.platform_preference != "cheapest":
             filtered = [q for q in quotes if q.platform == extracted.platform_preference]
             if filtered:
@@ -435,7 +444,6 @@ async def _try_nlu_fast_path(
         comparison = _format_comparison(quotes, loc_pickup.address, loc_dropoff.address)
         return Reply(comparison + pref_note)
 
-    # Case 2: Only pickup extracted
     if extracted.pickup and not extracted.dropoff and not data.get("pickup"):
         loc = await _resolve_location(extracted.pickup)
         if not loc:
@@ -471,9 +479,7 @@ async def handle_message(
     user = await _get_or_create_user(db, phone, channel)
     sess = await _get_session(db, user)
 
-    # ------------------------------------------------------------------ #
-    # Global commands (work from any state)
-    # ------------------------------------------------------------------ #
+    # Global commands
     if body_lower in {"help", "menu"}:
         return Reply(HELP_TEXT.strip())
 
@@ -488,10 +494,7 @@ async def handle_message(
             alert = _format_sos(trip, driver, phone)
             logger.critical("SOS activated: trip=%s user=%s", trip.id, phone)
             return Reply(alert)
-        return Reply(
-            "You do not have an active trip. "
-            "If this is an emergency, call 999 immediately."
-        )
+        return Reply("You do not have an active trip. If this is an emergency, call 999 immediately.")
 
     if body_lower == "cancel":
         trip = await _active_trip(db, user)
@@ -501,15 +504,9 @@ async def handle_message(
                 await driver_svc.release(db, trip.driver_id)
             await db.commit()
         await _set_state(db, sess, "idle", {})
-        return Reply(
-            "Trip cancelled.\n\n"
-            "Where would you like to go?\n"
-            "(Send an address or share a location pin)"
-        )
+        return Reply("Trip cancelled.\n\nWhere would you like to go?\n(Send an address or share a location pin)")
 
-    # ------------------------------------------------------------------ #
-    # In-trip state: STATUS, LOCATION, ARRIVED, DONE
-    # ------------------------------------------------------------------ #
+    # In-trip
     if sess.state == "in_trip":
         trip = await _active_trip(db, user)
         if not trip:
@@ -530,18 +527,12 @@ async def handle_message(
                 from app.services.geocoder import reverse_geocode
                 loc_text = await reverse_geocode(trip.pickup_lat, trip.pickup_lng)
                 return Reply(_format_driver_location(driver, trip, loc_text))
-            return Reply(
-                "Driver location not available yet. "
-                "Reply STATUS for trip details."
-            )
+            return Reply("Driver location not available yet. Reply STATUS for trip details.")
 
         if body_lower in {"arrived", "picked", "start"}:
             trip.status = "in_progress"
             await db.commit()
-            return Reply(
-                "Trip started. Safe journey! "
-                "Reply STATUS anytime, or DONE when you arrive."
-            )
+            return Reply("Trip started. Safe journey! Reply STATUS anytime, or DONE when you arrive.")
 
         if body_lower in {"done", "complete", "completed", "finish"}:
             trip.status = "completed"
@@ -551,81 +542,53 @@ async def handle_message(
             await db.commit()
             await _set_state(db, sess, "idle", {})
             return Reply(
-                f"Trip #{trip.id} completed.\n"
-                f"Fare: KES {trip.fare_kes:.0f}\n\n"
-                "Thank you for riding with Annex Mobility.\n"
-                "Send HI to book another trip."
+                f"Trip #{trip.id} completed.\nFare: KES {trip.fare_kes:.0f}\n\n"
+                "Thank you for riding with Annex Mobility.\nSend HI to book another trip."
             )
 
-        return Reply(
-            "You have an active trip.\n"
-            "Reply: STATUS | LOCATION | ARRIVED | DONE | CANCEL | SOS"
-        )
+        return Reply("You have an active trip.\nReply: STATUS | LOCATION | ARRIVED | DONE | CANCEL | SOS")
 
-    # ------------------------------------------------------------------ #
-    # Try NLU fast path for idle and awaiting_pickup
-    # ------------------------------------------------------------------ #
+    # NLU fast path
     if sess.state in {"idle", "awaiting_pickup"}:
         nlu_reply = await _try_nlu_fast_path(db, user, sess, body_raw)
         if nlu_reply:
             return nlu_reply
 
-    # ------------------------------------------------------------------ #
-    # idle state - casual greetings and conversation starters
-    # ------------------------------------------------------------------ #
+    # idle
     if sess.state == "idle":
-        # Casual greetings
         casual = CASUAL_RESPONSES.get(body_lower)
         if casual:
             await _set_state(db, sess, "awaiting_pickup", {})
             return Reply(casual)
 
-        # Ride-related keywords
         if body_lower in {"ride", "book", "start", "go"}:
             await _set_state(db, sess, "awaiting_pickup", {})
             return Reply(WELCOME_MESSAGE)
 
-        # Try NLU again
         nlu_reply = await _try_nlu_fast_path(db, user, sess, body_raw)
         if nlu_reply:
             return nlu_reply
 
-        # Default: treat as pickup location
         await _set_state(db, sess, "awaiting_pickup", {})
         loc = await _resolve_location(body_raw, latitude, longitude)
         if loc:
             await _set_state(db, sess, "awaiting_dropoff", {
                 "pickup": {"text": loc.address, "lat": loc.lat, "lng": loc.lng}
             })
-            return Reply(
-                f"Pickup: {loc.address}\n\n"
-                "Where are you going?\n"
-                "(Send an address or share a location pin)"
-            )
+            return Reply(f"Pickup: {loc.address}\n\nWhere are you going?\n(Send an address or share a location pin)")
         return Reply(WELCOME_MESSAGE)
 
-    # ------------------------------------------------------------------ #
     # awaiting_pickup
-    # ------------------------------------------------------------------ #
     if sess.state == "awaiting_pickup":
         loc = await _resolve_location(body_raw, latitude, longitude)
         if not loc:
-            return Reply(
-                "Sorry, I could not find that location. "
-                "Please try a clearer address or share a location pin."
-            )
+            return Reply("Sorry, I could not find that location. Please try a clearer address or share a location pin.")
         await _set_state(db, sess, "awaiting_dropoff", {
             "pickup": {"text": loc.address, "lat": loc.lat, "lng": loc.lng}
         })
-        return Reply(
-            f"Pickup: {loc.address}\n\n"
-            "Where are you going?\n"
-            "(Send an address or share a destination pin)"
-        )
+        return Reply(f"Pickup: {loc.address}\n\nWhere are you going?\n(Send an address or share a destination pin)")
 
-    # ------------------------------------------------------------------ #
     # awaiting_dropoff
-    # ------------------------------------------------------------------ #
     if sess.state == "awaiting_dropoff":
         if body_lower in {"back", "change"}:
             await _set_state(db, sess, "awaiting_pickup", {})
@@ -633,9 +596,7 @@ async def handle_message(
 
         loc = await _resolve_location(body_raw, latitude, longitude)
         if not loc:
-            return Reply(
-                "Sorry, I could not find that destination. Try a clearer address."
-            )
+            return Reply("Sorry, I could not find that destination. Try a clearer address.")
 
         data = json.loads(sess.data or "{}")
         p = data.get("pickup")
@@ -645,25 +606,16 @@ async def handle_message(
 
         try:
             quotes = await get_all_quotes(
-                pickup_address=p["text"],
-                dropoff_address=loc.address,
-                pickup_lat=p["lat"],
-                pickup_lng=p["lng"],
-                drop_lat=loc.lat,
-                drop_lng=loc.lng,
+                pickup_address=p["text"], dropoff_address=loc.address,
+                pickup_lat=p["lat"], pickup_lng=p["lng"],
+                drop_lat=loc.lat, drop_lng=loc.lng,
             )
         except Exception as exc:
             logger.error("Price fetch failed: %s", exc)
-            return Reply(
-                "Could not fetch prices right now. "
-                "Please try again. Send HI to restart."
-            )
+            return Reply("Could not fetch prices right now. Please try again. Send HI to restart.")
 
         if not quotes:
-            return Reply(
-                "Could not fetch prices right now. "
-                "Please try again. Send HI to restart."
-            )
+            return Reply("Could not fetch prices right now. Please try again. Send HI to restart.")
 
         quotes_json = [
             {
@@ -680,12 +632,9 @@ async def handle_message(
         data["quotes"] = quotes_json
         await _set_state(db, sess, "awaiting_platform", data)
 
-        comparison = _format_comparison(quotes, p["text"], loc.address)
-        return Reply(comparison)
+        return Reply(_format_comparison(quotes, p["text"], loc.address))
 
-    # ------------------------------------------------------------------ #
     # awaiting_platform
-    # ------------------------------------------------------------------ #
     if sess.state == "awaiting_platform":
         if body_lower in {"back", "change"}:
             data = json.loads(sess.data or "{}")
@@ -697,7 +646,10 @@ async def handle_message(
         quotes = _quotes_from_data(data)
 
         if body_lower in {"cheapest", "lowest", "best price"}:
-            chosen = quotes[0] if quotes else None
+            cars = [q for q in quotes if q["type"] == "car"]
+            bikes = [q for q in quotes if q["type"] == "motorbike"]
+            ordered = cars + bikes
+            chosen = ordered[0] if ordered else None
         else:
             chosen = _platform_from_choice(quotes, body_lower)
 
@@ -705,8 +657,7 @@ async def handle_message(
             total = len(quotes)
             return Reply(
                 f"Please reply with a number between 1 and {total} to choose.\n"
-                f"Or type: cheapest, uber, bolt, etc.\n"
-                f"Reply BACK to change destination."
+                f"Or type: cheapest, uber, bolt, etc.\nReply BACK to change destination."
             )
 
         p = data.get("pickup", {})
@@ -730,9 +681,7 @@ async def handle_message(
             "Reply YES to confirm or NO to choose a different option."
         )
 
-    # ------------------------------------------------------------------ #
     # awaiting_confirm
-    # ------------------------------------------------------------------ #
     if sess.state == "awaiting_confirm":
         if body_lower in {"no", "n", "back", "change"}:
             data = json.loads(sess.data or "{}")
@@ -787,22 +736,16 @@ async def handle_message(
                 trip.status = "cancelled"
                 await db.commit()
                 await _set_state(db, sess, "idle", {})
-                return Reply(
-                    "No drivers available right now.\n"
-                    "Please try again in a few minutes. Send HI to retry."
-                )
+                return Reply("No drivers available right now.\nPlease try again in a few minutes. Send HI to retry.")
             trip.driver_id = drv.id
             trip.status = "matched"
             await db.commit()
 
             await _set_state(db, sess, "in_trip", {"trip_id": trip.id})
-
             return Reply(_format_booking_confirmation(chosen, drv))
 
         return Reply("Please reply YES to confirm or NO to choose a different option.")
 
-    # ------------------------------------------------------------------ #
     # Fallback
-    # ------------------------------------------------------------------ #
     await _set_state(db, sess, "idle", {})
     return Reply("Send a message to start a booking, or HELP for commands.")
