@@ -4,7 +4,6 @@ Design goals:
 - No emojis. Plain text only.
 - Any message starts a conversation (niaje, hello, sasa, etc.)
 - Natural language understanding via Gemini
-- Interactive button support for platform selection
 - Live location sharing after booking
 """
 from __future__ import annotations
@@ -173,7 +172,7 @@ def _platform_from_choice(quotes: list[dict], choice: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _format_comparison(quotes: list[PlatformQuote], pickup: str, dropoff: str) -> str:
-    """Format platform comparison as clean text with WhatsApp buttons marker."""
+    """Format platform comparison as clean text with numbered choices."""
     if not quotes:
         return "Sorry, could not fetch prices right now. Please try again."
 
@@ -206,21 +205,11 @@ def _format_comparison(quotes: list[PlatformQuote], pickup: str, dropoff: str) -
             lines.append(f"  {offset + i}. {q.name} - KES {q.price_kes}{surge}{badge}")
 
     lines.append("")
-    lines.append("Tap a button below or reply with a number (e.g. 1)")
+    lines.append("Reply with the number of your choice (e.g. 1)")
     lines.append("Or type: uber, bolt, cheapest")
     lines.append("Reply BACK to change destination")
 
-    # Build WhatsApp interactive buttons (max 3)
-    all_quotes = cars + bikes
-    buttons = []
-    for i, q in enumerate(all_quotes[:3], 1):
-        label = f"{q.name} - KES {q.price_kes}"[:20]
-        buttons.append({"id": str(i), "title": label})
-
-    result = "\n".join(lines)
-    if buttons:
-        result += f"\n\n[[BUTTONS:{json.dumps(buttons)}]]"
-    return result
+    return "\n".join(lines)
 
 
 def _format_booking_confirmation(chosen: dict, driver: Driver) -> str:
