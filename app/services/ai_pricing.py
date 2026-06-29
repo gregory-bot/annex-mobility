@@ -1,20 +1,19 @@
 """Gemini AI-powered ride price estimation for multiple platforms.
 
 This module uses Google Gemini 2.5 Flash to estimate realistic KES prices
-across Uber, Bolt, Little, Yego, Faras, and Bolt Bike — based on distance,
+across Uber, Bolt, Little, Yego, Faras, and Bolt Bike - based on distance,
 time of day, and Kenyan market pricing (2025).
 
 When GEMINI_API_KEY is not set, it falls back to the deterministic formula.
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
@@ -24,15 +23,13 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Simple in-process TTL cache (15 minutes) — avoids hammering Gemini on
-# repeated identical routes. Replace with Redis at scale.
+# Simple in-process TTL cache (15 minutes)
 # ---------------------------------------------------------------------------
-_cache: dict[str, tuple[float, list]] = {}  # key -> (timestamp, result)
-_CACHE_TTL = 900  # seconds
+_cache: dict[str, tuple[float, list]] = {}
+_CACHE_TTL = 900
 
 
 def _cache_key(pickup_lat: float, pickup_lng: float, drop_lat: float, drop_lng: float) -> str:
-    # Round to ~500m precision so nearby requests reuse cache
     raw = f"{round(pickup_lat, 2)},{round(pickup_lng, 2)}-{round(drop_lat, 2)},{round(drop_lng, 2)}"
     return hashlib.md5(raw.encode()).hexdigest()
 
@@ -47,7 +44,6 @@ def _get_cache(key: str) -> Optional[list]:
 
 def _set_cache(key: str, data: list) -> None:
     _cache[key] = (time.time(), data)
-    # Evict old entries to prevent unbounded memory growth
     if len(_cache) > 5000:
         oldest = sorted(_cache.items(), key=lambda x: x[1][0])[:1000]
         for k, _ in oldest:
@@ -66,15 +62,14 @@ def _haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 
 def _duration_min(distance_km: float) -> float:
-    """Estimate travel time based on time of day."""
-    hour = time.localtime().tm_hour  # server local time (set TZ=Africa/Nairobi in env)
+    hour = time.localtime().tm_hour
     is_peak = (7 <= hour <= 10) or (17 <= hour <= 20)
     avg_speed = 15.0 if is_peak else 25.0
     return max((distance_km / avg_speed) * 60.0, 3.0)
 
 
 # ---------------------------------------------------------------------------
-# Deterministic formula fallback (no AI needed)
+# Platform pricing models
 # ---------------------------------------------------------------------------
 _PLATFORM_MODELS = {
     "uber":       {"base": 100, "per_km": 50,  "per_min": 3.0,  "min_fare": 150, "peak_surge": 1.25},
@@ -111,7 +106,7 @@ def _formula_prices(distance_km: float, duration_min: float) -> list[dict]:
     for platform, m in _PLATFORM_MODELS.items():
         surge = m["peak_surge"] if is_peak else 1.0
         price = max(m["base"] + distance_km * m["per_km"] + duration_min * m["per_min"], m["min_fare"])
-        price = round(price * surge / 10) * 10  # round to nearest 10 KES
+        price = round(price * surge / 10) * 10
         results.append({
             "platform": platform,
             "name": _PLATFORM_LABELS[platform],
@@ -138,7 +133,6 @@ async def _call_gemini(
     distance_km: float,
     duration_min: float,
 ) -> Optional[list[dict]]:
-    """Call Gemini 2.5 Flash to get price estimates. Returns None on failure."""
     if not settings.GEMINI_API_KEY:
         return None
 
@@ -164,7 +158,7 @@ Pricing rules for Kenya 2025:
 - Yego (motorbike): Base KES 50 + KES 35/km + KES 2/min. Peak surge +10%. Min KES 100.
 - Bolt Boda (motorbike): Base KES 40 + KES 32/km + KES 1.8/min. Peak surge +10%. Min KES 90.
 
-Add slight realistic variance (±5-15 KES) between similar platforms.
+Add slight realistic variance between similar platforms.
 For trips over 10km, cars become more economical vs motorbikes.
 For trips under 5km, motorbikes may be faster and cheaper.
 
@@ -193,7 +187,6 @@ Return ONLY valid JSON, no markdown, no explanation:
             data = r.json()
 
         text = data["candidates"][0]["content"]["parts"][0]["text"]
-        # Strip markdown fences if present
         text = text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         parsed = json.loads(text)
 
@@ -219,7 +212,7 @@ Return ONLY valid JSON, no markdown, no explanation:
 
 
 # ---------------------------------------------------------------------------
-# Deep-link URLs for each platform
+# Deep-link URLs
 # ---------------------------------------------------------------------------
 def get_deep_links(platform: str, pickup_lat: float, pickup_lng: float,
                    drop_lat: float, drop_lng: float) -> dict[str, str]:
@@ -284,12 +277,12 @@ def get_deep_links(platform: str, pickup_lat: float, pickup_lng: float,
 class PlatformQuote:
     platform: str
     name: str
-    type: str          # "car" | "motorbike"
+    type: str
     price_kes: int
     duration_min: int
     distance_km: float
     surge: bool
-    source: str        # "ai" | "formula"
+    source: str
     deep_link_app: str = ""
     deep_link_web: str = ""
     is_cheapest: bool = False
@@ -303,19 +296,15 @@ async def get_all_quotes(
     drop_lat: float,
     drop_lng: float,
 ) -> list[PlatformQuote]:
-    """Return price quotes from all platforms, sorted cheapest first."""
     distance_km = _haversine(pickup_lat, pickup_lng, drop_lat, drop_lng)
     duration_min = _duration_min(distance_km)
 
-    # Check cache first
     ckey = _cache_key(pickup_lat, pickup_lng, drop_lat, drop_lng)
     cached = _get_cache(ckey)
 
     if cached:
         raw_quotes = cached
-        source_tag = "cache"
     else:
-        # Try Gemini first, fall back to formula
         raw_quotes = await _call_gemini(
             pickup_address, dropoff_address,
             pickup_lat, pickup_lng, drop_lat, drop_lng,
@@ -348,38 +337,41 @@ async def get_all_quotes(
 
 
 def format_comparison_message(quotes: list[PlatformQuote], pickup: str, dropoff: str) -> str:
-    """Format a WhatsApp-friendly comparison message with numbered choices."""
+    """Format a comparison message with numbered choices (no emojis)."""
     if not quotes:
         return "Sorry, could not fetch prices right now. Please try again."
-
-    lines = [
-        f"🚖 *Price Comparison*",
-        f"📍 {pickup} → {dropoff}",
-        f"📏 {quotes[0].distance_km:.1f} km • ~{quotes[0].duration_min} min",
-        "",
-    ]
 
     cars = [q for q in quotes if q.type == "car"]
     bikes = [q for q in quotes if q.type == "motorbike"]
 
+    lines = [
+        "--- RIDE OPTIONS ---",
+        f"From: {pickup}",
+        f"To: {dropoff}",
+        f"Distance: {quotes[0].distance_km:.1f} km",
+        f"Est. time: ~{quotes[0].duration_min} min",
+        "",
+    ]
+
     if cars:
-        lines.append("🚗 *Cars:*")
+        lines.append("CARS:")
         for i, q in enumerate(cars, 1):
-            badge = " 🏆 CHEAPEST" if q.is_cheapest and len(bikes) == 0 else (" 🏆" if q.is_cheapest else "")
-            surge_tag = " ⚡surge" if q.surge else ""
-            lines.append(f"  {i}. *{q.name}* — KES {q.price_kes}{surge_tag}{badge}")
+            badge = " [CHEAPEST]" if q.is_cheapest and len(bikes) == 0 else ""
+            surge = " (surge)" if q.surge else ""
+            lines.append(f"  {i}. {q.name} - KES {q.price_kes}{surge}{badge}")
 
     if bikes:
         lines.append("")
-        lines.append("🏍️ *Boda Boda:*")
+        lines.append("BODA BODA:")
         offset = len(cars)
         for i, q in enumerate(bikes, 1):
-            badge = " 🏆 CHEAPEST" if q.is_cheapest else ""
-            surge_tag = " ⚡surge" if q.surge else ""
-            lines.append(f"  {offset + i}. *{q.name}* — KES {q.price_kes}{surge_tag}{badge}")
+            badge = " [CHEAPEST]" if q.is_cheapest else ""
+            surge = " (surge)" if q.surge else ""
+            lines.append(f"  {offset + i}. {q.name} - KES {q.price_kes}{surge}{badge}")
 
     lines.append("")
-    lines.append("Reply with the *number* to book (e.g. *1* for Uber)")
-    lines.append("Or reply *BACK* to change destination")
+    lines.append("Reply with the number to book (e.g. 1)")
+    lines.append("Or type: uber, bolt, cheapest")
+    lines.append("Reply BACK to change destination")
 
     return "\n".join(lines)

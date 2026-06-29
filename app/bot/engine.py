@@ -1,15 +1,11 @@
-"""Conversation state machine -- WhatsApp + SMS ride booking with multi-platform comparison.
+"""Conversational state machine - WhatsApp + SMS ride booking.
 
-States:
-  idle                -> greeting, prompt for pickup
-  awaiting_pickup     -> store pickup, ask for dropoff
-  awaiting_dropoff    -> store dropoff, fetch AI quotes, show comparison
-  awaiting_platform   -> user picks a platform number
-  awaiting_confirm    -> show chosen platform summary, ask YES/NO
-  in_trip             -> handles STATUS / LOCATION / ARRIVED / DONE / SOS / CANCEL
-
-NLU: When Gemini is available, free-text like "I need a ride from Westlands to JKIA"
-     extracts both locations in one shot, skipping the step-by-step flow.
+Design goals:
+- No emojis. Plain text only.
+- Any message starts a conversation (niaje, hello, sasa, etc.)
+- Natural language understanding via Gemini
+- Interactive button support for platform selection
+- Live location sharing after booking
 """
 from __future__ import annotations
 
@@ -25,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.entities import Driver, Session, Trip, User
 from app.services import drivers as driver_svc
 from app.services.geocoder import GeocodeResult, geocode
-from app.services.ai_pricing import get_all_quotes, format_comparison_message, PlatformQuote
+from app.services.ai_pricing import get_all_quotes, PlatformQuote
 from app.services.nlu import extract_ride_intent
 
 logger = logging.getLogger(__name__)
@@ -36,15 +32,52 @@ class Reply:
     text: str
 
 
-HELP = (
-    "*Commands*\n"
-    "- HI / START -- begin a new booking\n"
-    "- STATUS -- current trip status & ETA\n"
-    "- LOCATION -- driver's current location\n"
-    "- CANCEL -- cancel current request\n"
-    "- SOS -- emergency help\n"
-    "- HELP -- show this menu"
+HELP_TEXT = """
+[Annex Mobility]
+
+Available commands:
+  HI / START - Begin a new booking
+  STATUS     - Check your current trip
+  LOCATION   - See driver's location
+  CANCEL     - Cancel your ride
+  SOS        - Emergency help
+  HELP       - Show this menu
+
+Or just tell me where you want to go. For example:
+  "I need a ride from Westlands to JKIA"
+  "Get me an Uber to Sarit Centre"
+  "Bolt boda to CBD"
+
+Tip: You can also share a WhatsApp location pin.
+"""
+
+WELCOME_MESSAGE = (
+    "Welcome to Annex Mobility.\n\n"
+    "I can help you book a ride from multiple providers "
+    "(Uber, Bolt, Little, Faras, Yego) and find you the best price.\n\n"
+    "Where would you like to go?\n\n"
+    "For example: \"I need a ride from Westlands to JKIA\"\n"
+    "Or just tell me your pickup point and I will guide you from there."
 )
+
+CASUAL_RESPONSES = {
+    "niaje": "Niaje! Where would you like to go today?",
+    "sasa": "Sasa! Ready to find you a ride. Where are you heading?",
+    "habari": "Habari! Where can I take you today?",
+    "mambo": "Mambo! Tell me where you need to go.",
+    "poa": "Poa! Where would you like to go?",
+    "vipi": "Vipi! Where are you heading today?",
+    "hello": "Hello! Where would you like to go?",
+    "hi": "Hi there! Where can I take you?",
+    "hey": "Hey! Where are you heading?",
+    "good morning": "Good morning! Where would you like to go today?",
+    "good afternoon": "Good afternoon! Where can I take you?",
+    "good evening": "Good evening! Where are you heading?",
+    "how are you": "I am doing great, thanks for asking! How can I help you get where you need to go?",
+    "how are you doing": "I am good! Ready to help you find a ride. Where are you heading?",
+    "what's up": "Ready to help you get moving! Where would you like to go?",
+    "sup": "Ready when you are! Where are you heading?",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -136,33 +169,140 @@ def _platform_from_choice(quotes: list[dict], choice: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Trip status helpers (Feature B)
+# Message formatting (no emojis, plain text)
 # ---------------------------------------------------------------------------
 
-def _trip_status_message(trip: Trip, driver: Optional[Driver] = None) -> str:
-    """Generate a rich status message for an active trip."""
+def _format_comparison(quotes: list[PlatformQuote], pickup: str, dropoff: str) -> str:
+    """Format platform comparison as clean text with WhatsApp buttons marker."""
+    if not quotes:
+        return "Sorry, could not fetch prices right now. Please try again."
+
+    cars = [q for q in quotes if q.type == "car"]
+    bikes = [q for q in quotes if q.type == "motorbike"]
+
+    lines = [
+        "--- RIDE OPTIONS ---",
+        f"From: {pickup}",
+        f"To: {dropoff}",
+        f"Distance: {quotes[0].distance_km:.1f} km",
+        f"Est. time: ~{quotes[0].duration_min} min",
+        "",
+    ]
+
+    if cars:
+        lines.append("CARS:")
+        for i, q in enumerate(cars, 1):
+            badge = " [CHEAPEST]" if q.is_cheapest and len(bikes) == 0 else ""
+            surge = " (surge)" if q.surge else ""
+            lines.append(f"  {i}. {q.name} - KES {q.price_kes}{surge}{badge}")
+
+    if bikes:
+        lines.append("")
+        lines.append("BODA BODA:")
+        offset = len(cars)
+        for i, q in enumerate(bikes, 1):
+            badge = " [CHEAPEST]" if q.is_cheapest else ""
+            surge = " (surge)" if q.surge else ""
+            lines.append(f"  {offset + i}. {q.name} - KES {q.price_kes}{surge}{badge}")
+
+    lines.append("")
+    lines.append("Tap a button below or reply with a number (e.g. 1)")
+    lines.append("Or type: uber, bolt, cheapest")
+    lines.append("Reply BACK to change destination")
+
+    # Build WhatsApp interactive buttons (max 3)
+    all_quotes = cars + bikes
+    buttons = []
+    for i, q in enumerate(all_quotes[:3], 1):
+        label = f"{q.name} - KES {q.price_kes}"[:20]
+        buttons.append({"id": str(i), "title": label})
+
+    result = "\n".join(lines)
+    if buttons:
+        result += f"\n\n[[BUTTONS:{json.dumps(buttons)}]]"
+    return result
+
+
+def _format_booking_confirmation(chosen: dict, driver: Driver) -> str:
+    """Format booking confirmation."""
+    web_link = chosen.get("deep_link_web", "")
+    platform_name = chosen.get("name", "Ride")
+
+    msg = f"""
+--- BOOKING CONFIRMED ---
+
+Platform: {platform_name}
+Driver: {driver.name}
+Vehicle: {driver.vehicle}
+Plate: {driver.plate}
+Rating: {driver.rating}
+
+Fare: KES {chosen['price_kes']}
+Est. time: ~{chosen['duration_min']} min
+Distance: {chosen['distance_km']:.1f} km
+
+Pickup: {chosen.get('pickup_text', '')}
+Dropoff: {chosen.get('dropoff_text', '')}
+"""
+
+    if web_link:
+        msg += f"\nTrack your ride: {web_link}"
+
+    msg += """
+---
+You can reply:
+  STATUS - Check trip status
+  LOCATION - See driver position on map
+  CANCEL - Cancel ride
+  SOS - Emergency
+"""
+    return msg.strip()
+
+
+def _format_driver_location(driver: Driver, trip: Trip, loc_text: str) -> str:
+    """Format driver location with Google Maps link."""
+    maps_url = f"https://www.google.com/maps?q={trip.pickup_lat},{trip.pickup_lng}"
+    return f"""
+--- DRIVER LOCATION ---
+
+Driver: {driver.name}
+Vehicle: {driver.vehicle} ({driver.plate})
+Current area: {loc_text}
+Phone: {driver.phone}
+
+View on map: {maps_url}
+
+For your safety, share this with a friend.
+""".strip()
+
+
+def _format_trip_status(trip: Trip, driver: Optional[Driver] = None) -> str:
+    """Format trip status message."""
     status_labels = {
         "requested": "Looking for driver...",
-        "matched": "Driver confirmed!",
-        "arrived": "Driver has arrived!",
+        "matched": "Driver confirmed",
+        "arrived": "Driver has arrived",
         "in_progress": "Trip in progress",
     }
     label = status_labels.get(trip.status, trip.status)
 
+    maps_url = f"https://www.google.com/maps?q={trip.pickup_lat},{trip.pickup_lng}"
+
     lines = [
-        f"*Trip #{trip.id} -- {label}*",
-        f"Platform: {trip.chosen_platform_name or 'Ride'}",
+        f"--- TRIP #{trip.id} ---",
+        f"Status: {label}",
+        f"Platform: {trip.chosen_platform_name or 'N/A'}",
         f"From: {trip.pickup_text}",
         f"To: {trip.dropoff_text}",
         f"Fare: KES {trip.fare_kes:.0f}",
-        f"Distance: {trip.distance_km:.1f} km, ~{trip.duration_min:.0f} min",
+        f"Distance: {trip.distance_km:.1f} km",
+        f"Est. time: ~{trip.duration_min:.0f} min",
     ]
 
     if driver:
         lines.append("")
-        lines.append(f"*Driver:* {driver.name}")
-        lines.append(f"Plate: {driver.plate}")
-        lines.append(f"Vehicle: {driver.vehicle}")
+        lines.append(f"Driver: {driver.name}")
+        lines.append(f"Vehicle: {driver.vehicle} ({driver.plate})")
         lines.append(f"Rating: {driver.rating}")
         lines.append(f"Phone: {driver.phone}")
 
@@ -172,13 +312,15 @@ def _trip_status_message(trip: Trip, driver: Optional[Driver] = None) -> str:
         eta = max(trip.duration_min - elapsed, 1)
         lines.append(f"ETA: ~{eta:.0f} min remaining")
 
+    lines.append(f"\nView on map: {maps_url}")
+
     return "\n".join(lines)
 
 
-def _sos_message(trip: Trip, driver: Optional[Driver] = None, user_phone: str = "") -> str:
-    """Generate an emergency alert with full trip details."""
+def _format_sos(trip: Trip, driver: Optional[Driver], user_phone: str) -> str:
+    """Format SOS emergency alert."""
     lines = [
-        "*EMERGENCY -- SOS ACTIVATED*",
+        "--- EMERGENCY - SOS ACTIVATED ---",
         "",
         f"Passenger: {user_phone}",
         f"Trip #{trip.id}",
@@ -186,26 +328,26 @@ def _sos_message(trip: Trip, driver: Optional[Driver] = None, user_phone: str = 
         f"Dropoff: {trip.dropoff_text}",
         f"Fare: KES {trip.fare_kes:.0f}",
         f"Platform: {trip.chosen_platform_name or 'N/A'}",
-        f"Created: {trip.created_at}",
+        f"Time: {trip.created_at}",
         "",
     ]
     if driver:
         lines.append(f"Driver: {driver.name}")
-        lines.append(f"Plate: {driver.plate}")
-        lines.append(f"Vehicle: {driver.vehicle}")
+        lines.append(f"Vehicle: {driver.vehicle} ({driver.plate})")
         lines.append(f"Phone: {driver.phone}")
     else:
         lines.append("Driver: Not yet assigned")
 
     lines.append("")
-    lines.append("*Please take immediate action.*")
+    lines.append("Our safety team has been notified.")
+    lines.append("If in danger, call 999 immediately.")
     lines.append("Police: 999 | Ambulance: 112")
 
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# NLU pre-processor: skip step-by-step flow if intent is clear
+# NLU fast path - skip step-by-step if intent is clear
 # ---------------------------------------------------------------------------
 
 async def _try_nlu_fast_path(
@@ -227,15 +369,21 @@ async def _try_nlu_fast_path(
     if not extracted:
         return None
 
-    # Case 1: Both pickup AND dropoff in one message -- jump to pricing
+    # Case 1: Both pickup AND dropoff in one message
     if extracted.pickup and extracted.dropoff:
         loc_pickup = await _resolve_location(extracted.pickup)
         loc_dropoff = await _resolve_location(extracted.dropoff)
 
         if not loc_pickup:
-            return Reply(f"I found the destination ({extracted.dropoff}) but couldn't locate the pickup. Can you clarify where you are?")
+            return Reply(
+                f"I found the destination ({extracted.dropoff}) but could not locate "
+                "the pickup. Can you clarify where you are?"
+            )
         if not loc_dropoff:
-            return Reply(f"I found your pickup ({extracted.pickup}) but couldn't locate the destination. Where are you heading?")
+            return Reply(
+                f"I found your pickup ({extracted.pickup}) but could not locate "
+                "the destination. Where are you heading?"
+            )
 
         new_data = {
             "pickup": {"text": loc_pickup.address, "lat": loc_pickup.lat, "lng": loc_pickup.lng},
@@ -255,21 +403,25 @@ async def _try_nlu_fast_path(
             )
         except Exception as exc:
             logger.error("Price fetch failed: %s", exc)
-            quotes = []
+            return Reply("Could not fetch prices right now. Please try again. Send HI to restart.")
 
         if not quotes:
-            return Reply("Could not fetch prices right now. Please try again.\nOr send *HI* to restart.")
+            return Reply("Could not fetch prices right now. Please try again. Send HI to restart.")
 
         # Apply preference filter
-        if extracted.platform_preference == "cheapest":
-            pass
-        elif extracted.platform_preference and extracted.platform_preference not in ("cheapest", "fastest"):
-            quotes = [q for q in quotes if q.platform == extracted.platform_preference] or quotes
+        if extracted.platform_preference and extracted.platform_preference != "cheapest":
+            filtered = [q for q in quotes if q.platform == extracted.platform_preference]
+            if filtered:
+                quotes = filtered
 
         if extracted.vehicle_type == "motorbike":
-            quotes = [q for q in quotes if q.type == "motorbike"] or quotes
+            filtered = [q for q in quotes if q.type == "motorbike"]
+            if filtered:
+                quotes = filtered
         elif extracted.vehicle_type == "car":
-            quotes = [q for q in quotes if q.type == "car"] or quotes
+            filtered = [q for q in quotes if q.type == "car"]
+            if filtered:
+                quotes = filtered
 
         quotes_json = [
             {
@@ -287,25 +439,25 @@ async def _try_nlu_fast_path(
 
         pref_note = ""
         if extracted.platform_preference and extracted.platform_preference != "cheapest":
-            pref_note = f"\n_Filtered by: {extracted.platform_preference}_"
+            pref_note = f"\n(Filtered for: {extracted.platform_preference})"
         elif extracted.vehicle_type:
-            pref_note = f"\n_Filtered by: {extracted.vehicle_type}_"
+            pref_note = f"\n(Filtered for: {extracted.vehicle_type})"
 
-        comparison = format_comparison_message(quotes, loc_pickup.address, loc_dropoff.address)
+        comparison = _format_comparison(quotes, loc_pickup.address, loc_dropoff.address)
         return Reply(comparison + pref_note)
 
     # Case 2: Only pickup extracted
     if extracted.pickup and not extracted.dropoff and not data.get("pickup"):
         loc = await _resolve_location(extracted.pickup)
         if not loc:
-            return Reply("Sorry, I couldn't find that location. Please try a clearer address.")
+            return Reply("Sorry, I could not find that location. Please try a clearer address.")
         await _set_state(db, sess, "awaiting_dropoff", {
             "pickup": {"text": loc.address, "lat": loc.lat, "lng": loc.lng}
         })
         return Reply(
-            f"Pickup: *{loc.address}*\n\n"
+            f"Pickup set to: {loc.address}\n\n"
             "Where are you going?\n"
-            "_(Send an address or share a destination pin)_"
+            "(Send an address or share a location pin)"
         )
 
     return None
@@ -331,25 +483,26 @@ async def handle_message(
     sess = await _get_session(db, user)
 
     # ------------------------------------------------------------------ #
-    # Global commands
+    # Global commands (work from any state)
     # ------------------------------------------------------------------ #
-    if body_lower in {"help", "menu", "?"}:
-        return Reply(HELP)
+    if body_lower in {"help", "menu"}:
+        return Reply(HELP_TEXT.strip())
 
     if body_lower == "sos":
         trip = await _active_trip(db, user)
         if trip:
             driver = None
             if trip.driver_id:
-                driver = (await db.execute(select(Driver).where(Driver.id == trip.driver_id))).scalar_one_or_none()
-            alert = _sos_message(trip, driver, phone)
+                driver = (await db.execute(
+                    select(Driver).where(Driver.id == trip.driver_id)
+                )).scalar_one_or_none()
+            alert = _format_sos(trip, driver, phone)
             logger.critical("SOS activated: trip=%s user=%s", trip.id, phone)
-            return Reply(
-                alert
-                + "\n\nOur safety team has been notified."
-                + "\nIf life is in danger, call *999* immediately."
-            )
-        return Reply("You don't have an active trip. If this is an emergency, call *999* immediately.")
+            return Reply(alert)
+        return Reply(
+            "You do not have an active trip. "
+            "If this is an emergency, call 999 immediately."
+        )
 
     if body_lower == "cancel":
         trip = await _active_trip(db, user)
@@ -361,12 +514,67 @@ async def handle_message(
         await _set_state(db, sess, "idle", {})
         return Reply(
             "Trip cancelled.\n\n"
-            "Where should we pick you up?\n"
-            "_(Send an address, share a location pin, or type lat,lng)_"
+            "Where would you like to go?\n"
+            "(Send an address or share a location pin)"
         )
 
     # ------------------------------------------------------------------ #
-    # NLU fast path
+    # In-trip state: STATUS, LOCATION, ARRIVED, DONE
+    # ------------------------------------------------------------------ #
+    if sess.state == "in_trip":
+        trip = await _active_trip(db, user)
+        if not trip:
+            await _set_state(db, sess, "idle", {})
+            return Reply("Your trip has ended. Send HI to book another ride.")
+
+        driver = None
+        if trip.driver_id:
+            driver = (await db.execute(
+                select(Driver).where(Driver.id == trip.driver_id)
+            )).scalar_one_or_none()
+
+        if body_lower in {"status", "update"}:
+            return Reply(_format_trip_status(trip, driver))
+
+        if body_lower in {"location", "where", "position"}:
+            if driver:
+                from app.services.geocoder import reverse_geocode
+                loc_text = await reverse_geocode(trip.pickup_lat, trip.pickup_lng)
+                return Reply(_format_driver_location(driver, trip, loc_text))
+            return Reply(
+                "Driver location not available yet. "
+                "Reply STATUS for trip details."
+            )
+
+        if body_lower in {"arrived", "picked", "start"}:
+            trip.status = "in_progress"
+            await db.commit()
+            return Reply(
+                "Trip started. Safe journey! "
+                "Reply STATUS anytime, or DONE when you arrive."
+            )
+
+        if body_lower in {"done", "complete", "completed", "finish"}:
+            trip.status = "completed"
+            trip.completed_at = datetime.utcnow()
+            if trip.driver_id:
+                await driver_svc.release(db, trip.driver_id)
+            await db.commit()
+            await _set_state(db, sess, "idle", {})
+            return Reply(
+                f"Trip #{trip.id} completed.\n"
+                f"Fare: KES {trip.fare_kes:.0f}\n\n"
+                "Thank you for riding with Annex Mobility.\n"
+                "Send HI to book another trip."
+            )
+
+        return Reply(
+            "You have an active trip.\n"
+            "Reply: STATUS | LOCATION | ARRIVED | DONE | CANCEL | SOS"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Try NLU fast path for idle and awaiting_pickup
     # ------------------------------------------------------------------ #
     if sess.state in {"idle", "awaiting_pickup"}:
         nlu_reply = await _try_nlu_fast_path(db, user, sess, body_raw)
@@ -374,25 +582,38 @@ async def handle_message(
             return nlu_reply
 
     # ------------------------------------------------------------------ #
-    # idle
+    # idle state - casual greetings and conversation starters
     # ------------------------------------------------------------------ #
     if sess.state == "idle":
-        if body_lower in {"hi", "hello", "start", "hey", "ride", "book"}:
+        # Casual greetings
+        casual = CASUAL_RESPONSES.get(body_lower)
+        if casual:
             await _set_state(db, sess, "awaiting_pickup", {})
-            return Reply(
-                "*Welcome to Annex Mobility!*\n\n"
-                "We compare Uber, Bolt, Little, Faras & Yego to find you the best price.\n\n"
-                "Where should we pick you up?\n"
-                "_(Send an address, share a location pin, or type lat,lng)_"
-            )
+            return Reply(casual)
+
+        # Ride-related keywords
+        if body_lower in {"ride", "book", "start", "go"}:
+            await _set_state(db, sess, "awaiting_pickup", {})
+            return Reply(WELCOME_MESSAGE)
+
+        # Try NLU again
         nlu_reply = await _try_nlu_fast_path(db, user, sess, body_raw)
         if nlu_reply:
             return nlu_reply
+
+        # Default: treat as pickup location
         await _set_state(db, sess, "awaiting_pickup", {})
-        return Reply(
-            "Welcome! Where should we pick you up?\n"
-            '_(e.g. "Westlands, Nairobi" or share a location)_'
-        )
+        loc = await _resolve_location(body_raw, latitude, longitude)
+        if loc:
+            await _set_state(db, sess, "awaiting_dropoff", {
+                "pickup": {"text": loc.address, "lat": loc.lat, "lng": loc.lng}
+            })
+            return Reply(
+                f"Pickup: {loc.address}\n\n"
+                "Where are you going?\n"
+                "(Send an address or share a location pin)"
+            )
+        return Reply(WELCOME_MESSAGE)
 
     # ------------------------------------------------------------------ #
     # awaiting_pickup
@@ -400,14 +621,17 @@ async def handle_message(
     if sess.state == "awaiting_pickup":
         loc = await _resolve_location(body_raw, latitude, longitude)
         if not loc:
-            return Reply("Sorry, I couldn't find that location. Please try a clearer address.")
+            return Reply(
+                "Sorry, I could not find that location. "
+                "Please try a clearer address or share a location pin."
+            )
         await _set_state(db, sess, "awaiting_dropoff", {
             "pickup": {"text": loc.address, "lat": loc.lat, "lng": loc.lng}
         })
         return Reply(
-            f"Pickup: *{loc.address}*\n\n"
+            f"Pickup: {loc.address}\n\n"
             "Where are you going?\n"
-            "_(Send an address or share a destination pin)_"
+            "(Send an address or share a destination pin)"
         )
 
     # ------------------------------------------------------------------ #
@@ -420,13 +644,15 @@ async def handle_message(
 
         loc = await _resolve_location(body_raw, latitude, longitude)
         if not loc:
-            return Reply("Sorry, I couldn't find that destination. Try a clearer address.")
+            return Reply(
+                "Sorry, I could not find that destination. Try a clearer address."
+            )
 
         data = json.loads(sess.data or "{}")
         p = data.get("pickup")
         if not p:
             await _set_state(db, sess, "idle", {})
-            return Reply("Something went wrong. Send *HI* to start again.")
+            return Reply("Something went wrong. Send HI to start again.")
 
         try:
             quotes = await get_all_quotes(
@@ -439,12 +665,15 @@ async def handle_message(
             )
         except Exception as exc:
             logger.error("Price fetch failed: %s", exc)
-            quotes = []
+            return Reply(
+                "Could not fetch prices right now. "
+                "Please try again. Send HI to restart."
+            )
 
         if not quotes:
             return Reply(
-                "Could not fetch prices right now. Please try again in a moment.\n"
-                "Or send *HI* to restart."
+                "Could not fetch prices right now. "
+                "Please try again. Send HI to restart."
             )
 
         quotes_json = [
@@ -462,7 +691,7 @@ async def handle_message(
         data["quotes"] = quotes_json
         await _set_state(db, sess, "awaiting_platform", data)
 
-        comparison = format_comparison_message(quotes, p["text"], loc.address)
+        comparison = _format_comparison(quotes, p["text"], loc.address)
         return Reply(comparison)
 
     # ------------------------------------------------------------------ #
@@ -486,30 +715,30 @@ async def handle_message(
         if not chosen:
             total = len(quotes)
             return Reply(
-                f"Please reply with a number between 1 and {total} to choose a platform.\n"
-                f"Or type: *cheapest*, *uber*, *bolt*, etc.\n"
-                f"Reply *BACK* to change destination."
+                f"Please reply with a number between 1 and {total} to choose.\n"
+                f"Or type: cheapest, uber, bolt, etc.\n"
+                f"Reply BACK to change destination."
             )
+
+        p = data.get("pickup", {})
+        d = data.get("dropoff", {})
+        chosen["pickup_text"] = p.get("text", "")
+        chosen["dropoff_text"] = d.get("text", "")
 
         data["chosen"] = chosen
         await _set_state(db, sess, "awaiting_confirm", data)
 
-        p = data.get("pickup", {})
-        d = data.get("dropoff", {})
-        surge_note = " _(includes surge pricing)_" if chosen.get("surge") else ""
-        booking_note = (
-            f"\n\nAfter booking, your {chosen['name']} app will open automatically."
-            if chosen.get("deep_link_web") else ""
-        )
+        surge_note = " (includes surge pricing)" if chosen.get("surge") else ""
 
         return Reply(
-            f"*{chosen['name']}* selected{surge_note}\n\n"
+            f"--- YOUR SELECTION ---\n\n"
+            f"Platform: {chosen['name']}{surge_note}\n"
             f"From: {p.get('text', '')}\n"
             f"To: {d.get('text', '')}\n"
-            f"Fare: *KES {chosen['price_kes']}*\n"
-            f"~{chosen['duration_min']} min, {chosen['distance_km']:.1f} km"
-            f"{booking_note}\n\n"
-            "Reply *YES* to confirm or *NO* to choose a different platform."
+            f"Fare: KES {chosen['price_kes']}\n"
+            f"Est. time: ~{chosen['duration_min']} min\n"
+            f"Distance: {chosen['distance_km']:.1f} km\n\n"
+            "Reply YES to confirm or NO to choose a different option."
         )
 
     # ------------------------------------------------------------------ #
@@ -535,9 +764,9 @@ async def handle_message(
                 ]
                 data.pop("chosen", None)
                 await _set_state(db, sess, "awaiting_platform", data)
-                return Reply(format_comparison_message(quotes_obj, p.get("text", ""), d.get("text", "")))
+                return Reply(_format_comparison(quotes_obj, p.get("text", ""), d.get("text", "")))
             await _set_state(db, sess, "idle", {})
-            return Reply("Cancelled. Send *HI* to start again.")
+            return Reply("Cancelled. Send HI to start again.")
 
         if body_lower in {"yes", "y", "confirm", "ok"}:
             data = json.loads(sess.data or "{}")
@@ -547,7 +776,7 @@ async def handle_message(
 
             if not (p and d and chosen):
                 await _set_state(db, sess, "idle", {})
-                return Reply("Something went wrong. Send *HI* to start again.")
+                return Reply("Something went wrong. Send HI to start again.")
 
             trip = Trip(
                 user_id=user.id,
@@ -571,7 +800,7 @@ async def handle_message(
                 await _set_state(db, sess, "idle", {})
                 return Reply(
                     "No drivers available right now.\n"
-                    "Please try again in a few minutes. Send *HI* to retry."
+                    "Please try again in a few minutes. Send HI to retry."
                 )
             trip.driver_id = drv.id
             trip.status = "matched"
@@ -579,79 +808,12 @@ async def handle_message(
 
             await _set_state(db, sess, "in_trip", {"trip_id": trip.id})
 
-            web_link = chosen.get("deep_link_web", "")
-            app_launch = f"\n\n*Open {chosen['name']}:* {web_link}" if web_link else ""
+            return Reply(_format_booking_confirmation(chosen, drv))
 
-            return Reply(
-                f"*Booked via {chosen['name']}!*\n\n"
-                f"Driver: *{drv.name}*\n"
-                f"Plate: {drv.plate}\n"
-                f"Vehicle: {drv.vehicle}\n"
-                f"Rating: {drv.rating}\n"
-                f"Fare: *KES {chosen['price_kes']}*\n"
-                f"~{chosen['duration_min']} min away"
-                f"{app_launch}\n\n"
-                "Reply *STATUS* for updates | *LOCATION* for driver position | *CANCEL* to cancel | *SOS* for emergency"
-            )
-
-        return Reply("Please reply *YES* to confirm or *NO* to choose a different platform.")
-
-    # ------------------------------------------------------------------ #
-    # in_trip
-    # ------------------------------------------------------------------ #
-    if sess.state == "in_trip":
-        trip = await _active_trip(db, user)
-        if not trip:
-            await _set_state(db, sess, "idle", {})
-            return Reply("Your trip has ended. Send *HI* to book another ride.")
-
-        driver = None
-        if trip.driver_id:
-            driver = (await db.execute(select(Driver).where(Driver.id == trip.driver_id))).scalar_one_or_none()
-
-        if body_lower in {"status", "update"}:
-            return Reply(_trip_status_message(trip, driver))
-
-        if body_lower in {"location", "where", "position"}:
-            if driver:
-                from app.services.geocoder import reverse_geocode
-                loc_text = await reverse_geocode(trip.pickup_lat, trip.pickup_lng)
-                return Reply(
-                    f"*Driver Location*\n\n"
-                    f"{driver.name} is near *{loc_text}*\n"
-                    f"{driver.vehicle} ({driver.plate})\n"
-                    f"Phone: {driver.phone}\n\n"
-                    f"_For safety, share this with a friend._"
-                )
-            return Reply("Driver location not available yet. Reply *STATUS* for trip details.")
-
-        if body_lower in {"arrived", "picked", "start"}:
-            trip.status = "in_progress"
-            await db.commit()
-            return Reply("Trip started. Safe journey!\nReply *STATUS* anytime | *DONE* when you arrive.")
-
-        if body_lower in {"done", "complete", "completed", "finish"}:
-            trip.status = "completed"
-            trip.completed_at = datetime.utcnow()
-            if trip.driver_id:
-                await driver_svc.release(db, trip.driver_id)
-            await db.commit()
-            await _set_state(db, sess, "idle", {})
-            platform_tag = f" via {trip.chosen_platform_name}" if trip.chosen_platform_name else ""
-            return Reply(
-                f"Trip #{trip.id}{platform_tag} completed!\n"
-                f"Fare: KES {trip.fare_kes:.0f}\n\n"
-                "Thanks for riding with *Annex Mobility*!\n"
-                "Send *HI* for another trip."
-            )
-
-        return Reply(
-            "You're on an active trip!\n"
-            "Reply: *STATUS* | *LOCATION* | *ARRIVED* | *DONE* | *CANCEL* | *SOS*"
-        )
+        return Reply("Please reply YES to confirm or NO to choose a different option.")
 
     # ------------------------------------------------------------------ #
     # Fallback
     # ------------------------------------------------------------------ #
     await _set_state(db, sess, "idle", {})
-    return Reply("Send *HI* to start a booking, or *HELP* for commands.")
+    return Reply("Send a message to start a booking, or HELP for commands.")
