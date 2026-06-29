@@ -1,4 +1,4 @@
-"""Geocoding + distance/duration estimation.
+﻿"""Geocoding + distance/duration estimation.
 
 Uses Google Maps if GOOGLE_MAPS_API_KEY is configured; otherwise a deterministic
 mock that derives lat/lng from the address string so the bot is fully testable
@@ -61,3 +61,15 @@ def estimate_trip(p_lat: float, p_lng: float, d_lat: float, d_lng: float) -> tup
     km = haversine_km(p_lat, p_lng, d_lat, d_lng)
     minutes = (km / 28.0) * 60.0
     return round(km, 2), round(max(minutes, 1.0), 1)
+
+async def reverse_geocode(lat: float, lng: float) -> str:
+    """Mock reverse geocode."""
+    if not settings.GOOGLE_MAPS_API_KEY:
+        return f"near {lat:.4f}, {lng:.4f} (Nairobi area)"
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, params={"latlng": f"{lat},{lng}", "key": settings.GOOGLE_MAPS_API_KEY})
+        data = r.json()
+    if data.get("status") != "OK" or not data.get("results"):
+        return f"near {lat:.4f}, {lng:.4f}"
+    return data["results"][0]["formatted_address"]
